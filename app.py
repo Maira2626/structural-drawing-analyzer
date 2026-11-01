@@ -1,324 +1,199 @@
-"""Structural / Foundation PDF Analyzer V2 — auditable, rule-based extraction.
-
-Only observations in selectable PDF text are reported. Keyword hits in sheet titles
-are labeled as drawing references, not proof that a system was designed or used.
+"""Structural drawing specification and reinforcement schedule extractor.
+Run: streamlit run app.py
+PDF-native text is used; scanned-only pages are explicitly flagged.
 """
-import csv
 import io
-import json
 import re
+import json
+import csv
+import zipfile
 from collections import defaultdict
+from pathlib import Path
 
 import fitz
+import pandas as pd
 import streamlit as st
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
 
-st.set_page_config(page_title="Structural & Foundation Drawing Analyzer V2", page_icon="🏗️", layout="wide")
-
-STRENGTH_PATTERNS = [
-    ("Slab on grade", r"SLAB ON GRADE\s*:\s*([\d,]+)\s*PSI"),
-    ("Foundation walls, shear walls, columns, footings, grade beams", r"FOUNDATION WALLS\s*,\s*SHEAR WALLS\s*,?\s*COLUMNS\s*,\s*FOOTINGS\s*,\s*GRADE BEAMS\s*:\s*([\d,]+)\s*PSI"),
-    ("Framed slabs and beams", r"FRAMED SLABS AND BEAMS\s*:\s*([\d,]+)\s*PSI"),
-    ("Concrete topping and pads", r"CONCRETE TOPPING AND PAD\s*:\s*([\d,]+)\s*PSI"),
-    ("Other nonstructural elements", r"OTHER NON STRUCTURAL ELEMENTS\s*:\s*([\d,]+)\s*PSI"),
-    ("All other concrete", r"ALL OTHER CONCRETE\s*:?\s*([\d,]+)\s*PSI"),
-]
-
-SYSTEM_TERMS = {
-    "Mat foundation": [r"\bMAT FOUNDATION\b"],
-    "Pile caps": [r"\bPILE CAP\b"],
-    "Deep foundations / piles": [r"\b(?:PILE|PILES|DEEP FOUNDATION ELEMENTS)\b"],
-    "Isolated footings": [r"\bISOLATED FOOTINGS?\b", r"\bSPREAD FOOTINGS?\b"],
-    "Grade beams": [r"\bGRADE BEAMS?\b"],
-    "Shear walls": [r"\bSHEAR WALLS?\b"],
-    "Concrete columns": [r"\bCOLUMN SCHEDULE\b", r"\bCONCRETE COLUMNS?\b"],
-    "Framed concrete slabs": [r"\bFRAMED SLABS\b", r"\bSLAB REINFORCEMENT\b"],
-}
+STRENGTH_RE = re.compile(r'(?<!\d)(?:3|4|5|6|7|8|9|10|12|14)[,.]?000\s*(?:-\s*)?PSI\b', re.I)
+BAR_RE = re.compile(r'^#(?:[3-9]|10|11|14)$')
+HEADINGS = [("Lap splice", "LAP SPLICE LENGTH", 9), ("Straight development", "STRAIGHT BAR DEVELOPMENT LENGTH", 9), ("Hooked development", "HOOKED TENSION DEVELOPMENT", 6)]
+COVER_RE = re.compile(r'(?i)\b(?:MINIMUM\s+)?(?:CLEAR\s+)?COVER\b')
 
 
-def flatten(value):
-    return re.sub(r"\s+", " ", value.upper()).strip()
+def sheet_id(page):
+    candidates = re.findall(r'\b(?:FO|S)-\d{3}\.\d{2}\b', page.get_text())
+    return candidates[-1] if candidates else f'PDF page {page.number+1}'
 
 
-def snippet(text, start, end, width=60):
-    return text[max(0, start - width):min(len(text), end + width)].strip()
+def rows_from_words(page, clip):
+    words = page.get_text('words', clip=clip, sort=True)
+    clusters = []
+    for w in sorted(words, key=lambda w: (w[1], w[0])):
+        if not clusters or abs(w[1]-clusters[-1]['y']) > 3.2:
+            clusters.append({'y':w[1], 'words':[w]})
+        else:
+            clusters[-1]['words'].append(w)
+    return [(c['y'], ' '.join(w[4] for w in sorted(c['words'],key=lambda w:w[0]))) for c in clusters]
 
 
-def pdf_data(uploads):
-    entries, strengths, plans, story_claims, evidence, warnings = [], [], [], [], [], []
-    for upload in uploads:
-        name = upload.name
-        try:
-            doc = fitz.open(stream=upload.getvalue(), filetype="pdf")
-            if doc.needs_pass:
-                warnings.append(f"{name}: password-protected PDF; could not inspect.")
-                continue
-        except Exception as error:
-            warnings.append(f"{name}: failed to open ({error}).")
+def get_words(page):
+    return page.get_text('words', sort=False)
+
+
+def extract_strengths(page, filename):
+    # All explicit strengths are retained; proximity text gives context instead of guessing assignments.
+    results=[]
+    words=get_words(page)
+    for w in words:
+        if 'PSI' not in w[4].upper():continue
+        # PSI label often separate from numerical value; use words on same line immediately to its left.
+        group=sorted([z for z in words if abs(z[1]-w[1])<4 and z[0]<w[2] and z[2]>w[0]-110],key=lambda z:z[0])
+        snippet=' '.join(z[4] for z in group)
+        mm=list(STRENGTH_RE.finditer(snippet.replace('PSI,','PSI').replace('PSI.','PSI')))
+        if not mm:continue
+        psi=int(re.sub(r'[^0-9]','',mm[-1].group().upper().replace('PSI','')))
+        # Prioritize note lines in the left column; schedule headers are handled in tables.
+        line_words=sorted([z for z in words if abs(z[1]-w[1])<4 and z[0]<w[0]],key=lambda z:z[0])
+        context=' '.join(z[4] for z in line_words[-70:])
+        results.append({'file':filename,'sheet':sheet_id(page),'page':page.number+1,'strength_psi':psi,
+                        'nearby_text':context[-440:],'source':'Explicit PSI notation','review':'Confirm element/floor assignment against drawing'})
+    # deduplicate same page and local context, not different locations
+    return list({(r['page'],r['strength_psi'],r['nearby_text']):r for r in results}.values())
+
+
+def extract_cover(page, filename):
+    words=get_words(page);results=[]
+    # Target notes and preserve nearby text, including separately arranged numeric values.
+    for w in words:
+        if not COVER_RE.search(w[4]):continue
+        clip=fitz.Rect(max(0,w[0]-370),max(0,w[1]-28),min(page.rect.width,w[2]+460),min(page.rect.height,w[3]+75))
+        txt=' '.join(t for _,t in rows_from_words(page,clip))
+        results.append({'file':filename,'sheet':sheet_id(page),'page':page.number+1,'cover_note':txt[:650],
+                        'review':'Check applicability and drawing-specific exceptions'})
+    return list({(r['page'],r['cover_note']):r for r in results}.values())
+
+
+def find_headings(words, phrase):
+    # Heading text may be grouped into a single block but is word-split here.
+    matching=[]
+    for w in words:
+        if w[4].upper().strip(' :') not in {phrase.split()[0],phrase.split()[0]+':'}:continue
+        nearby=sorted([z for z in words if abs(z[1]-w[1])<5 and w[0]-4<=z[0]<w[0]+500],key=lambda z:z[0])
+        s=' '.join(z[4] for z in nearby).upper()
+        if phrase in s:matching.append((w[0],w[1]))
+    return matching
+
+
+def extract_schedule(page, filename):
+    words=get_words(page);output=[];warnings=[]
+    for title,phrase,numcols in HEADINGS:
+        starts=find_headings(words,phrase)
+        if not starts:
             continue
-        entries.append({"file": name, "pages": len(doc)})
-        first_page_text = ""
-        total_chars = 0
-        for index, pg in enumerate(doc):
-            raw = pg.get_text()
-            norm = flatten(raw)
-            total_chars += len(norm)
-            if index == 0:
-                first_page_text = raw
-            for match in re.finditer(r"\bNEW\s+(\d{1,2})\s*[- ]?STOR(?:Y|IES)\b", norm):
-                value = int(match.group(1))
-                story_claims.append({"stories": value, "file": name, "page": index + 1, "evidence": snippet(norm, match.start(), match.end())})
-            for label, pattern in STRENGTH_PATTERNS:
-                if "CAST-IN-PLACE CONCRETE" not in norm and label != "Slab on grade":
-                    continue
-                match = re.search(pattern, norm)
-                if match:
-                    strengths.append({"element": label, "psi": int(match.group(1).replace(",", "")),
-                                      "file": name, "page": index + 1, "sheet": "", "source": "Concrete strength schedule",
-                                      "evidence": match.group(0)})
-            general = re.search(r"CONCRETE FOR FOOTINGS,? PIERS,? AND SLABS ON GRADE SHALL HAVE A MINIMUM\s+COMPRESSIVE STRENGTH OF\s*([\d,]+)\s*[- ]?PSI", norm)
-            if general:
-                strengths.append({"element": "Footings, piers, slabs on grade (general foundation note)",
-                                  "psi": int(general.group(1).replace(",", "")), "file": name, "page": index + 1,
-                                  "sheet": "", "source": "General foundation note (unless otherwise noted)",
-                                  "evidence": general.group(0)})
-            # Evidence is limited to drawing titles / schedules and is not intended
-            # as confirmation that a particular system appears on plans.
-            for system, patterns in SYSTEM_TERMS.items():
-                for pattern in patterns:
-                    match = re.search(pattern, norm)
-                    if match:
-                        evidence.append({"system": system, "file": name, "page": index + 1,
-                                         "evidence": snippet(norm, match.start(), match.end(), 35),
-                                         "status": "Mentioned in notes/schedules; verify on plans"})
-                        break
-        if total_chars < 250:
-            warnings.append(f"{name}: very little selectable text. OCR for scanned sheets is not included.")
-        # Index is a structured listing in these drawing sets. Avoid treating
-        # every mention of a floor as a separate drawing.
-        pat = re.compile(r"(?m)^\s*(\d{1,2})\s*\n\s*((?:S|FO)-\d{3}\.\d{2})\s*\n\s*([^\n]+)")
-        for match in pat.finditer(first_page_text):
-            sheet_title = match.group(3).strip()
-            if any(key in sheet_title.upper() for key in ("FLOOR FRAMING PLAN", "ROOF FRAMING PLAN", "BULKHEAD FRAMING PLAN", "FOUNDATION PLAN", "PILE CAP", "MAT FOUNDATION", "COLUMN SCHEDULE", "SHEAR WALL SCHEDULE")):
-                plans.append({"file": name, "page": int(match.group(1)), "sheet": match.group(2), "title": sheet_title})
+        hx,hy=starts[0]
+        # Locate bar labels in the schedule immediately below the heading.
+        candidates=[w for w in words if BAR_RE.fullmatch(w[4]) and hx-300<w[0]<hx+100 and hy+(20 if title=='Hooked development' else 65)<w[1]<hy+320]
+        if not candidates:
+            warnings.append(f'{sheet_id(page)}: {title} heading found but no bar labels parsed')
+            continue
+        groups=defaultdict(list)
+        for w in candidates:groups[round(w[0]/12)*12].append(w)
+        labels=max(groups.values(),key=len)
+        labels=sorted(labels,key=lambda w:w[1])
+        base_x=sum(w[0] for w in labels)/len(labels)
+        # For 9-column schedules, normal 6/8/10 ksi headings; hooked tables have 2 cols per strength.
+        ncols=9 if title!='Hooked development' else 6
+        for j,label in enumerate(labels):
+            y=label[1]
+            if title=='Hooked development':
+                # Hook section has a 6-column layout.
+                offsets=[84,165,246,325,406,487]
+            else:
+                offsets=[59,99,159,221,261,321,383,423,483]
+            cells=[]
+            for off in offsets:
+                near=[w for w in words if abs(w[1]-y)<5 and abs(w[0]-(base_x+off))<13 and re.fullmatch(r'\d+',w[4])]
+                cells.append(int(min(near,key=lambda w:abs(w[0]-(base_x+off)))[4]) if near else None)
+            for k,psi in enumerate([6000,8000,10000]):
+                vals=cells[k*(ncols//3):(k+1)*(ncols//3)]
+                if title=='Hooked development':
+                    typ, ext=vals
+                    output.append({'file':filename,'sheet':sheet_id(page),'page':page.number+1,'schedule':title,
+                          'bar_size':label[4],'concrete_psi':psi,'tension_typ_in':typ,'tension_top_in':None,
+                          'compression_in':None,'hook_extension_in':ext,'review':'Verify table values and footnotes'})
+                else:
+                    typ,top,comp=vals
+                    output.append({'file':filename,'sheet':sheet_id(page),'page':page.number+1,'schedule':title,
+                          'bar_size':label[4],'concrete_psi':psi,'tension_typ_in':typ,'tension_top_in':top,
+                          'compression_in':comp,'hook_extension_in':None,'review':'Verify table values and footnotes'})
+        if not output: warnings.append(f'{sheet_id(page)}: Unable to obtain cells for {title}')
+    return output,warnings
+
+
+def extract_notes(page, filename):
+    # Retain significant notes verbatim so placement rules/adjustment multipliers are not lost.
+    text=page.get_text(sort=True)
+    patterns=['BAR LENGTH TABLE NOTES','MECHANICAL SPLICE ONLY','REINFORCING BARS SHALL',
+              'REINFORCEMENT SHALL','AIR ENTRAIN','CORROSION INHIBIT','LAP ','HOOK','COVER']
+    lines=text.splitlines();out=[]
+    for i,line in enumerate(lines):
+        if any(t in line.upper() for t in patterns):
+            out.append({'file':filename,'sheet':sheet_id(page),'page':page.number+1,'note':
+                        ' '.join(lines[max(0,i-1):min(len(lines),i+4)])[:500]})
+    return out
+
+
+def extract_files(files):
+    results={k:[] for k in ['Strengths','Covers','Rebar schedules','Relevant notes','QA warnings']}
+    for f in files:
+        data=f.getvalue();doc=fitz.open(stream=data,filetype='pdf')
+        for page in doc:
+            name=f.name
+            if len(page.get_text().strip())<60:
+                results['QA warnings'].append({'file':name,'sheet':sheet_id(page),'page':page.number+1,
+                     'warning':'Little/no embedded text. Scanned/outlined page may require OCR or visual review.'})
+                continue
+            results['Strengths']+=extract_strengths(page,name)
+            results['Covers']+=extract_cover(page,name)
+            arr,warn=extract_schedule(page,name)
+            results['Rebar schedules']+=arr
+            results['Relevant notes']+=extract_notes(page,name)
+            results['QA warnings'] += [{'file':name,'sheet':sheet_id(page),'page':page.number+1,'warning':x} for x in warn]
         doc.close()
-    # Deduplicate repeated text records on the exact same source page.
-    strengths = list({(r["element"], r["psi"], r["file"], r["page"]): r for r in strengths}.values())
-    plans = list({(p["file"], p["sheet"]): p for p in plans}.values())
-    evidence = list({(e["system"], e["file"], e["page"]): e for e in evidence}.values())
-    return entries, strengths, plans, story_claims, evidence, warnings
+    # Flag blanks explicitly, rather than fabricating values.
+    for row in results['Rebar schedules']:
+        fields=['tension_typ_in','hook_extension_in'] if row['schedule']=='Hooked development' else ['tension_typ_in','tension_top_in','compression_in']
+        if any(row[x] is None for x in fields):
+            results['QA warnings'].append({'file':row['file'],'sheet':row['sheet'],'page':row['page'],
+               'warning':f"Missing table cell: {row['schedule']}, {row['bar_size']}, {row['concrete_psi']} psi"})
+    return results
 
 
-def group_strengths(rows):
-    grouped = defaultdict(list)
-    for r in rows:
-        grouped[(r["element"], r["psi"])].append(r)
-    combined = []
-    for (element, psi), sources in grouped.items():
-        combined.append({"element": element, "psi": psi,
-                         "sources": "; ".join(f'{s["file"]} · page {s["page"]}' for s in sources),
-                         "source_count": len(sources)})
-    return sorted(combined, key=lambda r: (r["element"], r["psi"]))
+def excel_bytes(results):
+    out=io.BytesIO()
+    with pd.ExcelWriter(out,engine='openpyxl') as writer:
+        for name,rows in results.items():
+            pd.DataFrame(rows if rows else [{'message':'No records detected'}]).to_excel(writer,sheet_name=name[:31],index=False)
+            ws=writer.sheets[name[:31]]
+            ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
+            for col in ws.columns:
+                letter=col[0].column_letter
+                ws.column_dimensions[letter].width=min(65,max(15,max(len(str(c.value or '')) for c in list(col)[:100])+2))
+    return out.getvalue()
 
-
-def detect_conflicts(rows):
-    issues = []
-    general = [r for r in rows if r["element"].startswith("Footings, piers")]
-    footings = [r for r in rows if "columns, footings, grade beams" in r["element"].lower()]
-    differing = [(a, b) for a in general for b in footings if a["psi"] != b["psi"]]
-    if differing:
-        general_refs = "; ".join(sorted({f'{a["file"]} page {a["page"]} ({a["psi"]:,} psi)' for a, _ in differing}))
-        schedule_refs = "; ".join(sorted({f'{b["file"]} page {b["page"]} ({b["psi"]:,} psi)' for _, b in differing}))
-        issues.append("Footing-strength note difference: general note " + general_refs +
-                      "; cast-in-place schedule " + schedule_refs +
-                      '. The general note states “unless otherwise noted.” Confirm which requirement governs with the drawings/EOR; not automatically resolved.')
-    # Any different strengths for an exact same element label are also highlighted.
-    by_element = defaultdict(set)
-    for r in rows:
-        by_element[r["element"]].add(r["psi"])
-    for element, vals in by_element.items():
-        if len(vals) > 1:
-            issues.append(f'{element}: multiple listed strengths ({", ".join(f"{v:,}" for v in sorted(vals))} psi). Check revisions, notes and detail overrides.')
-    return issues
-
-
-def csv_blob(rows):
-    if not rows:
-        return b""
-    f = io.StringIO()
-    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
-    return f.getvalue().encode("utf-8-sig")
-
-
-def pdf_report(report):
-    """Create a readable, multi-page summary entirely in memory."""
-    from xml.sax.saxutils import escape
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=42, leftMargin=42,
-                            topMargin=45, bottomMargin=44, title="Structural Drawing Analysis")
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="ReportTitle", parent=styles["Title"], fontSize=17, leading=22,
-                              textColor=colors.HexColor("#183252"), spaceAfter=10))
-    styles.add(ParagraphStyle(name="ReportSection", parent=styles["Heading2"], fontSize=11,
-                              leading=14, textColor=colors.HexColor("#183252"), spaceBefore=13, spaceAfter=6))
-    styles.add(ParagraphStyle(name="ReportCell", parent=styles["Normal"], fontSize=7, leading=10))
-    styles.add(ParagraphStyle(name="ReportSmall", parent=styles["Normal"], fontSize=8, leading=12))
-    story_nums = {r["stories"] for r in report["stories"]}
-    story_label = str(next(iter(story_nums))) if len(story_nums) == 1 else ("Review conflicting entries" if story_nums else "Not found")
-    content = [Paragraph("Structural & Foundation Drawing Analysis", styles["ReportTitle"]),
-               Paragraph("Rule-based text extraction; review original drawings and confirm discrepancies with the engineer of record.", styles["ReportSmall"])]
-    def heading(text):
-        content.append(Paragraph(escape(text), styles["ReportSection"]))
-    def tbl(headers, data, widths):
-        def cell(x):
-            return Paragraph(escape(str(x if x is not None else "")).replace("\n", "<br/>"), styles["ReportCell"])
-        rows = [[cell(v) for v in headers]] + [[cell(v) for v in row] for row in data]
-        t = Table(rows, colWidths=widths, repeatRows=1, hAlign="LEFT")
-        t.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#e3eaf2")),
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("GRID", (0,0), (-1,-1), .3, colors.HexColor("#cbd5e1")),
-            ("LEFTPADDING", (0,0), (-1,-1), 6), ("RIGHTPADDING", (0,0), (-1,-1), 6),
-            ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5),
-        ]))
-        content.append(t)
-    heading("Project overview")
-    tbl(["Parameter", "Result"], [
-        ("Stories identified", story_label),
-        ("Floor framing plan sheets", len(report["floor_framing_sheets"])),
-        ("Roof / bulkhead plan sheets", len(report["roof_bulkhead_sheets"])),
-        ("Uploaded PDF pages", sum(f["pages"] for f in report["files"])),
-    ], [210, 318])
-    heading("Uploaded drawing sets")
-    tbl(["File", "PDF pages"], [(r["file"], r["pages"]) for r in report["files"]], [442,86])
-    heading("Concrete strengths - 28-day f'c")
-    strengths = report["strength_summary"]
-    if strengths:
-        tbl(["Element", "psi", "Sources / evidence"], [
-            (r.get("element",""), f'{r.get("psi", ""):,}' if isinstance(r.get("psi"),int) else r.get("psi",""),
-             "; ".join(f'{k}: {v}' for k,v in r.items() if k not in ("element","psi")))
-            for r in strengths], [178,49,301])
-    else:
-        content.append(Paragraph("No concrete strengths found in selectable text.", styles["ReportSmall"]))
-    heading("Foundation and structural system references")
-    evid = report["system_references"]
-    if evid:
-        by_system = defaultdict(list)
-        for r in evid:
-            by_system[r["system"]].append(r)
-        tbl(["Mentioned system", "First source", "Status"], [
-            (name, f'{rows[0]["file"]} - PDF p. {rows[0]["page"]}', "Mentioned; verify on plans")
-            for name, rows in sorted(by_system.items())], [132,265,131])
-    else:
-        content.append(Paragraph("No system references found.", styles["ReportSmall"]))
-    heading("Drawing index")
-    plans = report["drawing_index"]
-    if plans:
-        tbl(["Sheet", "Title", "Source"], [
-            (r.get("sheet", r.get("drawing", "")), r.get("title", ""),
-             f'{r.get("file", "")} - PDF p. {r.get("page", "")}') for r in plans], [81,220,227])
-    else:
-        content.append(Paragraph("No drawing index entries found.", styles["ReportSmall"]))
-    heading("Warnings and verification")
-    if report["warnings"]:
-        for msg in report["warnings"]:
-            content.append(Paragraph("- " + escape(str(msg)), styles["ReportSmall"]))
-            content.append(Spacer(1, 5))
-    else:
-        content.append(Paragraph("No predefined warnings triggered. This does not establish drawing approval.", styles["ReportSmall"]))
-    def footer(canvas, pdfdoc):
-        canvas.setFont("Helvetica", 8)
-        canvas.setFillColor(colors.grey)
-        canvas.drawString(42, 28, "Extracted summary - verify against the issued drawings")
-        canvas.drawRightString(letter[0]-42, 28, f"Page {pdfdoc.page}")
-    doc.build(content, onFirstPage=footer, onLaterPages=footer)
-    return buffer.getvalue()
-
-
-st.title("Structural & Foundation Drawing Analyzer")
-st.caption("Version 2 · Project summary + detailed evidence · PDF page preview")
-st.info("Rule-based extraction from selectable PDF text. Drawing titles and note mentions do not prove construction systems; inspect the actual plans and ask the EOR about ambiguous specifications.")
-uploads = st.file_uploader("Upload structural and foundation drawing sets (PDF)", type="pdf", accept_multiple_files=True)
-if uploads:
-    with st.spinner("Analyzing notes and drawing indexes..."):
-        file_info, raw_strengths, plans, stories, system_evidence, warnings = pdf_data(uploads)
-    grouped_strengths = group_strengths(raw_strengths)
-    conflicts = detect_conflicts(raw_strengths)
-    floor_plans = [p for p in plans if "FLOOR FRAMING PLAN" in p["title"].upper()]
-    roof_plans = [p for p in plans if any(x in p["title"].upper() for x in ("ROOF FRAMING PLAN", "BULKHEAD FRAMING PLAN"))]
-    story_values = {s["stories"] for s in stories}
-    st.subheader("Project overview")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Stories identified", next(iter(story_values)) if len(story_values) == 1 else ("Review" if story_values else "Not found"))
-    col2.metric("Floor framing plan sheets", len(floor_plans))
-    col3.metric("Roof / bulkhead sheets", len(roof_plans))
-    col4.metric("PDF pages", sum(r["pages"] for r in file_info))
-    st.caption("Number of framing-plan sheets is not the number of floors; a typical plan may cover multiple levels. Basement count is not inferred unless explicitly documented.")
-    if len(story_values) > 1:
-        st.warning("Different story counts were found: " + ", ".join(map(str, sorted(story_values))))
-    if stories:
-        with st.expander("Story-count evidence"):
-            st.dataframe(stories, hide_index=True, use_container_width=True)
-    st.subheader("Concrete compressive strength — 28-day f'c")
-    st.dataframe(grouped_strengths, use_container_width=True, hide_index=True)
-    with st.expander("Show each original concrete note / citation"):
-        st.dataframe(raw_strengths, use_container_width=True, hide_index=True)
-    st.subheader("Foundation & structural systems — references to review")
-    st.caption("These are keyword mentions, not verified as-built or design-system classifications. A title like 'MAT FOUNDATION DETAIL' alone does not confirm a mat was selected for the entire project.")
-    system_rows = []
-    by_system = defaultdict(list)
-    for row in system_evidence:
-        by_system[row["system"]].append(row)
-    for label, rows in sorted(by_system.items()):
-        system_rows.append({"system / element": label, "status": "Mentioned — plan verification needed",
-                            "first reference": f'{rows[0]["file"]} · page {rows[0]["page"]}',
-                            "matching pages": len(rows)})
-    if system_rows:
-        st.dataframe(system_rows, hide_index=True, use_container_width=True)
-        with st.expander("System mentions and supporting text"):
-            st.dataframe(system_evidence, hide_index=True, use_container_width=True)
-    else:
-        st.write("No matching system references found in selectable text.")
-    st.subheader("Drawing index")
-    if plans:
-        st.dataframe(plans, hide_index=True, use_container_width=True)
-    else:
-        st.write("No matching plan entries were found; inspect drawing indexes manually.")
-    st.subheader("Warnings & verification")
-    if conflicts:
-        for issue in conflicts:
-            st.warning(issue)
-    else:
-        st.success("No predefined concrete-strength conflicts detected (not an engineering approval).")
-    for message in warnings:
-        st.warning(message)
-    st.subheader("Source PDF page preview")
-    source_names = [u.name for u in uploads]
-    chosen_name = st.selectbox("PDF", source_names)
-    chosen_file = next(u for u in uploads if u.name == chosen_name)
-    preview_doc = fitz.open(stream=chosen_file.getvalue(), filetype="pdf")
-    page_no = st.number_input("PDF page (1-based)", min_value=1, max_value=len(preview_doc), value=1, step=1)
-    st.caption("Use the file and page from the table above to inspect the original drawing. Preview locations are approximate; this version does not highlight individual callouts.")
-    pix = preview_doc[int(page_no)-1].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-    st.image(pix.tobytes("png"), caption=f"{chosen_name} — page {page_no}", use_container_width=True)
-    preview_doc.close()
-    st.subheader("Export data")
-    report = {"files": file_info, "stories": stories, "floor_framing_sheets": floor_plans,
-              "roof_bulkhead_sheets": roof_plans, "strength_summary": grouped_strengths,
-              "strength_evidence": raw_strengths, "system_references": system_evidence,
-              "drawing_index": plans, "warnings": conflicts + warnings}
-    st.download_button("Download PDF report", pdf_report(report), "structural_drawing_summary_v2.pdf", "application/pdf", type="primary")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("Full report (JSON)", json.dumps(report, indent=2).encode(), "structural_summary_v2.json", "application/json")
-    c2.download_button("Strengths (CSV)", csv_blob(grouped_strengths), "concrete_strength_summary.csv", "text/csv", disabled=not grouped_strengths)
-    c3.download_button("Drawing index (CSV)", csv_blob(plans), "drawing_index.csv", "text/csv", disabled=not plans)
-    c4.download_button("System refs (CSV)", csv_blob(system_rows), "system_references.csv", "text/csv", disabled=not system_rows)
-else:
-    st.write("Upload your PDFs to receive a source-linked project summary and browse the original drawing pages.")
+st.set_page_config(page_title='Structural PDF Extractor V3',layout='wide')
+st.title('Structural Drawing PDF Extractor — V3')
+st.caption('Extract concrete strengths, covers, lap splice/development schedules and source-linked notes. Review all engineering results against the originals.')
+files=st.file_uploader('Upload foundation and structural drawing PDFs',type=['pdf'],accept_multiple_files=True)
+if files and st.button('Extract drawing information',type='primary'):
+    with st.spinner('Reading PDF drawing text and schedules…'):
+        result=extract_files(files)
+    st.session_state['extract_result']=result
+if 'extract_result' in st.session_state:
+    result=st.session_state['extract_result']
+    for name,rows in result.items():
+        with st.expander(f'{name} ({len(rows)})',expanded=name in ['Strengths','Covers','Rebar schedules']):
+            st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+    st.download_button('Download Excel report',data=excel_bytes(result),file_name='structural_extraction_v3.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    st.download_button('Download JSON',data=json.dumps(result,indent=2),file_name='structural_extraction_v3.json',mime='application/json')
+    st.warning('Numbers from drawings must be verified by an engineer. OCR for scanned-only drawings is not included. Missing cells and conflicting notes require manual review.')
