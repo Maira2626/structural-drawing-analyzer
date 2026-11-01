@@ -14,6 +14,7 @@ import fitz
 import pandas as pd
 import streamlit as st
 from extractor import extract_strength_schedules
+from adaptive import extract_adaptive_strengths, extract_adaptive_covers
 from rebar import extract_rebar_dynamic
 
 REBAR_HEADINGS = (
@@ -188,9 +189,24 @@ def extract_files(files):
                 out["qa_warnings"].append({"file": file, "sheet": sheet_id(page), "page": page.number + 1,
                                            "warning": "Little or no embedded text; visual review/OCR may be necessary."})
                 continue
-            _, covers, notes = get_strength_cover_specs(page, file)
-            strengths, strength_issues = extract_strength_schedules(page, file, sheet_id(page))
+            _, legacy_covers, notes = get_strength_cover_specs(page, file)
+            strengths, strength_issues = extract_adaptive_strengths(page, file, sheet_id(page))
+            older_strengths, older_strength_warnings = extract_strength_schedules(page, file, sheet_id(page))
+            if len(older_strengths) > len(strengths):
+                strengths = older_strengths
+                strength_issues.append({"file": file, "sheet": sheet_id(page), "page": page.number+1,
+                   "warning": "Fallback parsing recovered additional strength rows; verify their descriptions against the original drawing."})
+            covers, cover_issues = extract_adaptive_covers(page, file, sheet_id(page))
+            if len(legacy_covers) > len(covers):
+                covers = legacy_covers
+                cover_issues.append({"file": file, "sheet": sheet_id(page), "page": page.number+1,
+                   "warning": "Fallback cover parsing recovered additional cover rows; verify original."})
+            page_text = page.get_text()
+            if ("COMPRESSIVE STRENGTH" in page_text.upper() and "PSI" in page_text.upper() and not strengths):
+                strength_issues.append({"file": file, "sheet": sheet_id(page), "page": page.number+1,
+                   "warning": "Compressive-strength text detected, but no structured schedule was extracted. Inspect this sheet directly."})
             rebars, issues = extract_rebar_dynamic(page, file, sheet_id(page))
+            issues.extend(cover_issues)
             issues.extend(strength_issues)
             out["strengths"].extend(strengths)
             out["covers"].extend(covers)
@@ -415,7 +431,7 @@ def run_app():
     st.markdown("""<div class='app-hero'>
 <div class='app-kicker'>Elevated Engineering NYC · Structural Design</div>
 <div class='app-title'>Structural Drawing Analyzer</div>
-<div class='app-subtitle'>Adaptable concrete-strength schedules · Covers · Reinforcement lengths</div>
+<div class='app-subtitle'>Drawing-source strength and cover schedules · Reinforcement lengths · Review flags</div>
 </div>""", unsafe_allow_html=True)
 
     files = st.file_uploader("Upload foundation and superstructure drawing PDFs", type="pdf", accept_multiple_files=True)
@@ -427,15 +443,15 @@ def run_app():
         else:
             with st.spinner("Extracting drawing schedules…"):
                 try:
-                    st.session_state["v6_result"] = extract_files(files)
-                    st.session_state["v6_signature"] = signature
+                    st.session_state["v7_result"] = extract_files(files)
+                    st.session_state["v7_signature"] = signature
                 except Exception as exc:
                     st.error(f"Unable to analyze the uploaded PDF: {exc}")
 
-    if "v6_result" in st.session_state and st.session_state.get("v6_signature") != signature:
+    if "v7_result" in st.session_state and st.session_state.get("v7_signature") != signature:
         st.info("Files changed. Click Extract drawing schedules to refresh the results.")
-    elif "v6_result" in st.session_state:
-        data = st.session_state["v6_result"]
+    elif "v7_result" in st.session_state:
+        data = st.session_state["v7_result"]
         strength_count = len(comparable_rows(data["strengths"], "strengths"))
         cover_count = len(comparable_rows(data["covers"], "covers"))
         st.markdown(f"<div class='source-line'>{data['file_count']} PDF(s) · {data['page_count']} pages · {strength_count} strength rows · {cover_count} cover rows</div>", unsafe_allow_html=True)
@@ -449,11 +465,11 @@ def run_app():
         with tab_rebar:
             schedules = data["rebar_schedules"]
             sources = []
-            for typ in ("S", "FO"):
+            for typ in ("S", "FO", "Other"):
                 if any(discipline(r["sheet"]) == typ for r in schedules):
                     sources.append(typ)
             if sources:
-                labels = {"S": "Superstructure (S)", "FO": "Foundation (FO)"}
+                labels = {"S": "Superstructure (S)", "FO": "Foundation (FO)", "Other": "Other drawing sheets"}
                 source = st.radio("Drawing set", sources, format_func=lambda x: labels[x], horizontal=True)
                 specific = [r for r in schedules if discipline(r["sheet"]) == source]
                 st.markdown(source_labels(specific), unsafe_allow_html=True)
@@ -462,17 +478,17 @@ def run_app():
                     with tab:
                         rebar_schedule_table([r for r in specific if r["schedule"] == kind], kind)
             else:
-                st.info("No reinforcement schedules could be extracted.")
+                st.info("No reinforcement schedules could be extracted. This does not mean the drawings have no reinforcement requirements; inspect the Review & export tab and the original sheets.")
         with tab_export:
             st.markdown("**Download extracted schedules**")
             left, right = st.columns(2)
             with left:
                 st.download_button("Download Excel workbook", excel_report(data),
-                                   file_name="structural_analyzer_v6.xlsx",
+                                   file_name="structural_analyzer_v7.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             with right:
                 st.download_button("Download JSON", json.dumps(data, indent=2),
-                                   file_name="structural_analyzer_v6.json", mime="application/json")
+                                   file_name="structural_analyzer_v7.json", mime="application/json")
             if data["other_strength_notes"]:
                 with st.expander(f"Other compressive-strength notes ({len(data['other_strength_notes'])})"):
                     for r in data["other_strength_notes"]:

@@ -4,7 +4,7 @@ Synthetic PDFs contain embedded text modeled on the four supplied screenshots.
 import unittest
 from pathlib import Path
 import fitz
-from extractor import extract_strength_schedules
+from adaptive import extract_adaptive_strengths as extract_strength_schedules, extract_adaptive_covers
 from rebar import extract_rebar_dynamic
 
 ROOT=Path(__file__).parent

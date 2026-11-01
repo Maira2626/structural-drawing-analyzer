@@ -1,46 +1,56 @@
-# Structural Drawing Analyzer V6 — Generalized schedules
+# Structural Drawing Analyzer — V7 (corrective update)
 
-Developed by Elevated Engineering NYC.
+**Purpose:** Extract concrete strength, cover, and reinforcement schedules from structural drawing PDFs and show them as compact, source-referenced tables.
 
-## What changed
+## Important limitation
+V7 is a more adaptive parser, **not a universal 100%-accurate extractor**. A PDF's text encoding/layout may differ significantly from what its on-screen drawing looks like. Scanned or outlined text is not automatically recognized; no extracted value should be used for structural design without verifying the source sheet.
 
-**Concrete compressive strengths:** The extractor no longer assumes a particular project, A–G categories, nine rows, 4/6/8/10 ksi values, or floor ranges. It finds positioned text beneath a concrete compressive strength note and matches each lettered entry to its PSI value. It also recognizes:
+## Changes from V6
+- Strength parser uses geometry and actual PSI text rather than a preset category list, project name, or 720-pixel table width.
+- Processes multiline elements, floor ranges within parentheses, and indented floor lines.
+- Cover parser similarly uses source text positions to read the schedule.
+- Ignores unrelated lettered tables and keeps source page references.
+- Flags pages that mention compressive strength but do not yield a structured schedule.
+- Rebar panel handles unclassified sheet names (in addition to FO and S), and reports unsupported layouts rather than silently substituting values.
+- Retains compact strength/cover and lap/development displays and the Elevated Engineering NYC footer.
 
-- A–F and A–I schedules, and schedules without the full heading (flagged for review)
-- Floor ranges beside the strength, indented underneath a category, or in parentheses beside the element
-- Wrapped descriptions, including multiple elements sharing a single strength
-- Arbitrary concrete strengths, not just 4,000/6,000/8,000/10,000 psi
-- Foundation/superstructure comparisons based on category + floor range, not the A/B/C letter (which can differ between sets)
+## Tests performed
+- Both uploaded 202 East 120th Street files (43 pages total): 9 strengths in each general-note schedule, 7 cover rows in each, and 168 reinforcement schedule entries total.
+- Four synthetic text PDFs modeled after the supplied alternate-project screenshots: 6/6, 9/9, 6/6, and 6/6 strength values.
+- These tests **do not validate actual other-project PDFs**, which were not supplied. For a failure, upload the actual failing PDF and expected schedule screenshot so we can test the exact encoding/layout.
 
-**Lap and development schedules:** The parser reads column strength headings and numeric row values from PDF geometry rather than assuming 6,000/8,000/10,000 psi or fixed distances between columns. The hooked tension development columns are read separately from hook extensions. Unsupported table configurations are flagged instead of being filled with guessed values. The schedule table layout currently supports the rectangular formats illustrated by the supplied drawings; other patterns may need extension.
+## Installation / website update
+Your existing Streamlit deployment can use the same GitHub repository and URL.
 
-**Other functionality:** Compact website remains, including concrete cover schedules, drawing/page references, note-conflict alerts and Excel/JSON downloads.
+1. Extract the ZIP.
+2. In the repo root upload or replace **all seven files**:
+   - `app.py`
+   - `adaptive.py` **(new and required)**
+   - `extractor.py`
+   - `rebar.py`
+   - `requirements.txt`
+   - `README.md`
+   - `test_extractor.py`
+3. Commit to `main`, allow Streamlit to deploy, and reload the website.
 
-## Limitations
-
-No extractor can guarantee 100% accuracy across all possible engineering plans. This version is designed for **text-searchable (native-text) PDFs**, and may miss details drawn as raster images, outlined vector shapes, CAD text with unusual ordering, or irregular table layouts. It **does not perform OCR**. The original drawing and engineer's interpretation always take precedence. If a sheet returns no values or a table is unsupported, review the PDF manually. Where no heading is detected, inferred schedules are labeled and flagged.
-
-## Install locally
+Run locally:
 
 ```bash
 python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Update your existing GitHub/Streamlit site
+Tests:
 
-1. Extract the ZIP.
-2. Upload all **five application files** into the root of `Maira2626/structural-drawing-analyzer`, replacing existing files when prompted:
-   - `app.py`
-   - `extractor.py` **(new; required)**
-   - `rebar.py` **(new; required)**
-   - `requirements.txt`
-   - `README.md`
-3. Commit directly to the `main` branch.
-4. Streamlit Cloud should redeploy from GitHub automatically.
+```bash
+python -m unittest test_extractor -v
+```
 
-`test_extractor.py` is optional; keep it for reproducible tests if desired.
+## Why a drawing can still fail
+- Scanned image only, no embedded text layer
+- Text represented by exploded glyphs or unusual font encoding
+- Strength values without units under a separate column header
+- Large multi-column notes with rotated/reversed text
+- Reinforcement tables that don't use recognizable headings and grid structures
 
-## Validation
-
-The generalized text parser was tested on synthetic text-based PDFs reproducing the four supplied schedule patterns and on both original 202 East 120th Street drawing sets. These are regression tests for the examples, not proof of universal accuracy on unseen drawings.
+A missing result is **not** evidence that the drawing lacks the requirement. Inspect the original and Review & export tab.
