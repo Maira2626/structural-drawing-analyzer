@@ -1,575 +1,490 @@
-"""Structural drawing extractor - cleaner schedule-style UI.
-Run: streamlit run app.py
+"""Structural Drawing Analyzer V5 — compact, source-aware engineering schedules.
+
+Run with `streamlit run app.py`. Uses embedded PDF text (no speculative OCR).
 """
+
 import io
 import json
 import re
-import zipfile
 from collections import defaultdict
+from html import escape
 from pathlib import Path
 
 import fitz
 import pandas as pd
 import streamlit as st
+from extractor import extract_strength_schedules
+from rebar import extract_rebar_dynamic
 
-BAR_RE = re.compile(r'^#(?:[3-9]|10|11|14)$')
-HEADINGS = [
+REBAR_HEADINGS = (
     ("Lap splice", "LAP SPLICE LENGTH"),
     ("Straight development", "STRAIGHT BAR DEVELOPMENT LENGTH"),
     ("Hooked development", "HOOKED TENSION DEVELOPMENT"),
-]
+)
+BAR_RE = re.compile(r"#(?:[3-9]|10|11)\b")
+PSI_RE = re.compile(r"(?<!\d)(\d{1,2}[, ]?\d{3})\s*-?\s*PSI\b", re.I)
+LETTERS = "ABCDEFG"
 
 
-# -------------------------
-# Extraction helpers
-# -------------------------
 def sheet_id(page):
-    candidates = re.findall(r'\b(?:FO|S)-\d{3}\.\d{2}\b', page.get_text())
-    return candidates[-1] if candidates else f'PDF page {page.number + 1}'
+    matches = re.findall(r"\b(?:FO|FDN|F|FOUND|S|ST|STR|A|G)-\d{2,4}(?:[.\-]\d{1,3})?\b", page.get_text(), re.I)
+    return matches[-1] if matches else f"PDF page {page.number + 1}"
 
 
-def get_text_blocks(page):
-    return page.get_text("blocks", sort=True)
+def discipline(sheet):
+    prefix = sheet.upper().split("-")[0]
+    if prefix in {"FO", "F", "FDN", "FOUND"}:
+        return "FO"
+    if prefix in {"S", "ST", "STR"}:
+        return "S"
+    return "Other"
 
 
-def get_words(page):
-    return page.get_text("words", sort=False)
+def block_lines(text):
+    return [s.strip() for s in text.splitlines() if s.strip()]
 
 
-def parse_strength_block(block_text, file_name, sheet, page_num):
-    lines = [ln.strip() for ln in block_text.splitlines() if ln.strip()]
-    rows = []
-    i = 0
-    current_letter = None
-    current_item = None
-    while i < len(lines):
-        line = lines[i]
-        if re.fullmatch(r'[A-G]\.', line):
-            current_letter = line[0]
-            item = lines[i + 1].rstrip(':') if i + 1 < len(lines) else ''
-            current_item = item
-            # look ahead for either direct psi or floor-specific sub-rows
-            if i + 2 < len(lines) and 'PSI' in lines[i + 2].upper():
-                strength_line = lines[i + 2]
-                psi = int(re.sub(r'[^0-9]', '', strength_line.split('PSI')[0]))
-                weight = 'NORMAL WEIGHT' if 'NORMAL WEIGHT' in strength_line.upper() else ''
-                rows.append({
-                    'file': file_name,
-                    'sheet': sheet,
-                    'page': page_num,
-                    'letter': current_letter,
-                    'element': current_item,
-                    'level_range': '',
-                    'strength_psi': psi,
-                    'weight': weight,
-                })
-                i += 3
+def parse_strength_block(text, file, sheet, page):
+    """Parse A-G concrete specifications; keep C and D floor-dependent rows.
+
+    Handles native PDF blocks where the letter, element, level and PSI can
+    each occupy a separate line. Avoids grabbing PSI table column headers.
+    """
+    chunks = re.split(r"(?m)^\s*([A-G])\.\s*", text)
+    out = []
+    for i in range(1, len(chunks), 2):
+        letter, body = chunks[i], chunks[i + 1]
+        lines = block_lines(body)
+        if not lines:
+            continue
+        element = lines[0].rstrip(": ")
+        if not element or PSI_RE.search(element):
+            continue
+        for j, line in enumerate(lines[1:], start=1):
+            match = PSI_RE.search(line)
+            if not match:
                 continue
-            elif i + 4 < len(lines):
-                # multi-line / floor-specific case
-                j = i + 2
-                while j + 1 < len(lines) and not re.fullmatch(r'[A-G]\.', lines[j]):
-                    if 'PSI' in lines[j + 1].upper():
-                        level = lines[j]
-                        strength_line = lines[j + 1]
-                        psi = int(re.sub(r'[^0-9]', '', strength_line.split('PSI')[0]))
-                        weight = 'NORMAL WEIGHT' if 'NORMAL WEIGHT' in strength_line.upper() else ''
-                        rows.append({
-                            'file': file_name,
-                            'sheet': sheet,
-                            'page': page_num,
-                            'letter': current_letter,
-                            'element': current_item,
-                            'level_range': level,
-                            'strength_psi': psi,
-                            'weight': weight,
-                        })
-                        j += 2
-                    else:
-                        break
-                i = j
-                continue
-        i += 1
-    return rows
-
-
-def parse_cover_block(block_text, file_name, sheet, page_num):
-    lines = [ln.strip() for ln in block_text.splitlines() if ln.strip()]
-    rows = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if re.fullmatch(r'[A-G]\.', line):
-            letter = line[0]
-            element = lines[i + 1].rstrip(':') if i + 1 < len(lines) else ''
-            cover = lines[i + 2] if i + 2 < len(lines) else ''
-            rows.append({
-                'file': file_name,
-                'sheet': sheet,
-                'page': page_num,
-                'letter': letter,
-                'element': element,
-                'cover': cover,
+            level = ""
+            if j > 1:
+                preceding = lines[j - 1].strip()
+                if not PSI_RE.search(preceding) and preceding.upper() != element.upper():
+                    # The level is normally just before its corresponding PSI.
+                    level = preceding
+            out.append({
+                "file": file, "sheet": sheet, "page": page,
+                "letter": letter, "element": element,
+                "level_range": level, "strength_psi": int(re.sub(r"\D", "", match.group(1))),
+                "weight": "NORMAL WEIGHT" if "NORMAL WEIGHT" in line.upper() else "",
             })
-            i += 3
-        else:
-            i += 1
-    return rows
+    return out
 
 
-def extract_strengths_and_covers(page, filename):
-    strengths, covers, relevant_notes = [], [], []
-    blocks = get_text_blocks(page)
+def parse_cover_block(text, file, sheet, page):
+    chunks = re.split(r"(?m)^\s*([A-G])\.\s*", text)
+    out = []
+    for i in range(1, len(chunks), 2):
+        letter, body = chunks[i], chunks[i + 1]
+        lines = block_lines(body)
+        if len(lines) < 2:
+            continue
+        element = lines[0].rstrip(": ")
+        cover = next((x for x in lines[1:] if re.search(r"(?:\d(?:-\d+)?/\d+|\d+)\s+INCH", x, re.I)), None)
+        if cover is None:
+            continue
+        out.append({"file": file, "sheet": sheet, "page": page,
+                    "letter": letter, "element": element, "cover": cover})
+    return out
+
+
+def get_strength_cover_specs(page, file):
     sheet = sheet_id(page)
-    page_num = page.number + 1
+    n = page.number + 1
+    blocks = page.get_text("blocks")
+    strengths, covers, misc = [], [], []
 
-    for _, _, _, _, text, *_ in blocks:
+    for b in blocks:
+        text = b[4]
         upper = text.upper()
-        if 'CONCRETE SHALL HAVE A MIN. COMPRESSIVE STRENGTH AT 28 DAYS' in upper:
-            relevant_notes.append({
-                'file': filename,
-                'sheet': sheet,
-                'page': page_num,
-                'category': 'Strength note heading',
-                'note': 'CONCRETE SHALL HAVE A MIN. COMPRESSIVE STRENGTH AT 28 DAYS AS FOLLOWS, UNLESS OTHERWISE NOTED ON THE DRAWINGS.'
-            })
-        elif re.search(r'^A\.$', text.strip().splitlines()[0] if text.strip().splitlines() else '') and 'SLAB ON GRADE' in upper and 'PSI' in upper:
-            strengths.extend(parse_strength_block(text, filename, sheet, page_num))
-        elif 'ALL CONCRETE EXPOSED TO FREEZE AND THAW' in upper:
-            relevant_notes.append({
-                'file': filename,
-                'sheet': sheet,
-                'page': page_num,
-                'category': 'Concrete durability',
-                'note': 'All concrete exposed to freeze and thaw in service shall have an air entraining agent.'
-            })
-        elif 'ALL CONCRETE EXPOSED TO MOISTURE IN SERVICE' in upper:
-            relevant_notes.append({
-                'file': filename,
-                'sheet': sheet,
-                'page': page_num,
-                'category': 'Concrete durability',
-                'note': 'All concrete exposed to moisture in service shall have a corrosion inhibiting admixture added.'
-            })
-        elif 'MINIMUM CONCRETE COVER SHALL BE AS FOLLOWS' in upper:
-            covers.extend(parse_cover_block(text, filename, sheet, page_num))
-        elif 'ALL REINFORCING BARS SHALL CONFORM TO ASTM A615' in upper or 'ALL REINFORCING BARS SHALL CONFORM TO ASTM A615.' in upper:
-            relevant_notes.append({
-                'file': filename,
-                'sheet': sheet,
-                'page': page_num,
-                'category': 'Rebar material',
-                'note': 'All reinforcing bars shall conform to ASTM A615. Grade 60 steel for #8 bars and lower. Grade 80 steel for #9 bars and higher.'
-            })
-
-    # Deduplicate within sheet
-    strengths = list({(r['sheet'], r['letter'], r['element'], r['level_range'], r['strength_psi']): r for r in strengths}.values())
-    covers = list({(r['sheet'], r['letter'], r['element'], r['cover']): r for r in covers}.values())
-    relevant_notes = list({(r['sheet'], r['category'], r['note']): r for r in relevant_notes}.values())
-    return strengths, covers, relevant_notes
+        if "SLAB ON GRADE" in upper and "FOUNDATION WALLS" in upper and "PSI" in upper and b[0] < page.rect.width * 0.55:
+            strengths.extend(parse_strength_block(text, file, sheet, n))
+        elif "MINIMUM CONCRETE COVER SHALL BE AS FOLLOWS" in upper:
+            covers.extend(parse_cover_block(text, file, sheet, n))
+        # Capture explicit compressive-strength notes outside the A-G schedule.
+        elif ("COMPRESSIVE STRENGTH" in upper and "PSI" in upper
+              and not ("SLAB ON GRADE" in upper and "FOUNDATION WALLS" in upper)):
+            found = PSI_RE.findall(text)
+            if found:
+                misc.append({"file": file, "sheet": sheet, "page": n,
+                             "strengths_psi": ", ".join(str(int(x.replace(",", "").replace(" ", ""))) for x in found),
+                             "note": " ".join(block_lines(text))[:650]})
+    return strengths, covers, misc
 
 
-def find_headings(words, phrase):
-    matching = []
-    first_word = phrase.split()[0]
-    for w in words:
-        if w[4].upper().strip(' :') not in {first_word, first_word + ':'}:
+def extract_rebar(page, file):
+    """Use actual schedule header blocks to avoid falsely reading CMU splice notes."""
+    sheet, page_n = sheet_id(page), page.number + 1
+    words, blocks = page.get_text("words", sort=False), page.get_text("blocks", sort=False)
+    data, issues = [], []
+    for name, phrase in REBAR_HEADINGS:
+        headers = [b for b in blocks if b[4].strip().upper().startswith(phrase)]
+        if not headers:
             continue
-        nearby = sorted([z for z in words if abs(z[1] - w[1]) < 5 and w[0] - 4 <= z[0] < w[0] + 540], key=lambda z: z[0])
-        s = ' '.join(z[4] for z in nearby).upper()
-        if phrase in s:
-            matching.append((w[0], w[1]))
-    return matching
-
-
-def extract_schedule(page, filename):
-    words = get_words(page)
-    output = []
-    warnings = []
-    sheet = sheet_id(page)
-    page_num = page.number + 1
-
-    for title, phrase in HEADINGS:
-        starts = find_headings(words, phrase)
-        if not starts:
+        header = min(headers, key=lambda b: b[1])
+        hx, hy = header[:2]
+        labels = [w for w in words if BAR_RE.fullmatch(w[4])
+                  and hx - 300 < w[0] < hx + 100
+                  and hy + (20 if name == "Hooked development" else 65) < w[1] < hy + 320]
+        if not labels:
+            issues.append({"file": file, "sheet": sheet, "page": page_n,
+                           "warning": f"{name}: schedule heading was found but rows could not be read."})
             continue
-        hx, hy = starts[0]
-        candidates = [
-            w for w in words
-            if BAR_RE.fullmatch(w[4])
-            and hx - 300 < w[0] < hx + 100
-            and hy + (20 if title == 'Hooked development' else 65) < w[1] < hy + 320
-        ]
-        if not candidates:
-            warnings.append({'file': filename, 'sheet': sheet, 'page': page_num, 'warning': f'{title}: heading found but no bar labels parsed'})
+        grouped = defaultdict(list)
+        for w in labels:
+            grouped[round(w[0] / 12) * 12].append(w)
+        labels = sorted(max(grouped.values(), key=len), key=lambda w: w[1])
+        if len(labels) < 3:
+            issues.append({"file": file, "sheet": sheet, "page": page_n,
+                           "warning": f"{name}: too few recognizable bar-size rows."})
             continue
-
-        groups = defaultdict(list)
-        for w in candidates:
-            groups[round(w[0] / 12) * 12].append(w)
-        labels = sorted(max(groups.values(), key=len), key=lambda w: w[1])
-        base_x = sum(w[0] for w in labels) / len(labels)
-
-        if title == 'Hooked development':
-            offsets = [84, 165, 246, 325, 406, 487]
-        else:
-            offsets = [59, 99, 159, 221, 261, 321, 383, 423, 483]
-
-        for label in labels:
-            y = label[1]
+        x_base = sum(w[0] for w in labels) / len(labels)
+        offsets = ([84, 165, 246, 325, 406, 487] if name == "Hooked development"
+                   else [59, 99, 159, 221, 261, 321, 383, 423, 483])
+        for w in labels:
             cells = []
-            for off in offsets:
-                near = [
-                    w for w in words
-                    if abs(w[1] - y) < 5 and abs(w[0] - (base_x + off)) < 13 and re.fullmatch(r'\d+', w[4])
-                ]
-                cells.append(int(min(near, key=lambda w: abs(w[0] - (base_x + off)))[4]) if near else None)
-
-            for k, psi in enumerate([6000, 8000, 10000]):
-                if title == 'Hooked development':
-                    vals = cells[k * 2:(k + 1) * 2]
-                    typ, ext = vals
-                    output.append({
-                        'file': filename, 'sheet': sheet, 'page': page_num, 'schedule': title,
-                        'bar_size': label[4], 'concrete_psi': psi,
-                        'tension_typ_in': typ, 'tension_top_in': None, 'compression_in': None,
-                        'hook_extension_in': ext,
-                    })
+            for offset in offsets:
+                found = [p for p in words if abs(p[1] - w[1]) < 5
+                         and abs(p[0] - (x_base + offset)) < 13
+                         and re.fullmatch(r"\d+", p[4])]
+                cells.append(int(min(found, key=lambda a: abs(a[0] - (x_base + offset)))[4]) if found else None)
+            for group_i, psi in enumerate((6000, 8000, 10000)):
+                if name == "Hooked development":
+                    typ, ext = cells[group_i * 2:(group_i + 1) * 2]
+                    top = comp = None
                 else:
-                    vals = cells[k * 3:(k + 1) * 3]
-                    typ, top, comp = vals
-                    output.append({
-                        'file': filename, 'sheet': sheet, 'page': page_num, 'schedule': title,
-                        'bar_size': label[4], 'concrete_psi': psi,
-                        'tension_typ_in': typ, 'tension_top_in': top, 'compression_in': comp,
-                        'hook_extension_in': None,
-                    })
-    for row in output:
-        req = ['tension_typ_in', 'hook_extension_in'] if row['schedule'] == 'Hooked development' else ['tension_typ_in', 'tension_top_in', 'compression_in']
-        if any(row[k] is None for k in req):
-            warnings.append({'file': row['file'], 'sheet': row['sheet'], 'page': row['page'], 'warning': f"Missing cell in {row['schedule']} - {row['bar_size']} @ {row['concrete_psi']} psi"})
-    return output, warnings
+                    typ, top, comp = cells[group_i * 3:(group_i + 1) * 3]
+                    ext = None
+                record = {"file": file, "sheet": sheet, "page": page_n,
+                          "schedule": name, "bar_size": w[4], "concrete_psi": psi,
+                          "tension_typ_in": typ, "tension_top_in": top,
+                          "compression_in": comp, "hook_extension_in": ext}
+                data.append(record)
+                needed = (typ, ext) if name == "Hooked development" else (typ, top, comp)
+                if any(x is None for x in needed):
+                    issues.append({"file": file, "sheet": sheet, "page": page_n,
+                                   "warning": f"Missing {name} table cell: {w[4]} at {psi:,} psi"})
+    return data, issues
 
 
 def extract_files(files):
-    result = {
-        'strengths': [],
-        'covers': [],
-        'rebar_schedules': [],
-        'notes': [],
-        'qa_warnings': [],
-    }
-    for file in files:
-        doc = fitz.open(stream=file.getvalue(), filetype='pdf')
+    out = {key: [] for key in ("strengths", "covers", "rebar_schedules", "other_strength_notes", "qa_warnings")}
+    out["file_count"] = len(files)
+    out["page_count"] = 0
+    for f in files:
+        doc = fitz.open(stream=f.getvalue(), filetype="pdf")
+        out["page_count"] += len(doc)
         for page in doc:
-            name = file.name
-            if len(page.get_text().strip()) < 60:
-                result['qa_warnings'].append({
-                    'file': name,
-                    'sheet': sheet_id(page),
-                    'page': page.number + 1,
-                    'warning': 'Little or no embedded text detected. This page may need OCR/manual review.'
-                })
+            file = f.name
+            if len(page.get_text().strip()) < 50:
+                out["qa_warnings"].append({"file": file, "sheet": sheet_id(page), "page": page.number + 1,
+                                           "warning": "Little or no embedded text; visual review/OCR may be necessary."})
                 continue
-            strengths, covers, notes = extract_strengths_and_covers(page, name)
-            schedules, warnings = extract_schedule(page, name)
-            result['strengths'].extend(strengths)
-            result['covers'].extend(covers)
-            result['notes'].extend(notes)
-            result['rebar_schedules'].extend(schedules)
-            result['qa_warnings'].extend(warnings)
+            _, covers, notes = get_strength_cover_specs(page, file)
+            strengths, strength_issues = extract_strength_schedules(page, file, sheet_id(page))
+            rebars, issues = extract_rebar_dynamic(page, file, sheet_id(page))
+            issues.extend(strength_issues)
+            out["strengths"].extend(strengths)
+            out["covers"].extend(covers)
+            out["other_strength_notes"].extend(notes)
+            out["rebar_schedules"].extend(rebars)
+            out["qa_warnings"].extend(issues)
         doc.close()
-
-    # final dedupe across files/sheets/records
-    result['strengths'] = list({(r['file'], r['sheet'], r['letter'], r['element'], r['level_range'], r['strength_psi']): r for r in result['strengths']}.values())
-    result['covers'] = list({(r['file'], r['sheet'], r['letter'], r['element'], r['cover']): r for r in result['covers']}.values())
-    result['rebar_schedules'] = list({(r['file'], r['sheet'], r['schedule'], r['bar_size'], r['concrete_psi']): r for r in result['rebar_schedules']}.values())
-    result['notes'] = list({(r['file'], r['sheet'], r['category'], r['note']): r for r in result['notes']}.values())
-    result['qa_warnings'] = list({(r['file'], r['sheet'], r['warning']): r for r in result['qa_warnings']}.values())
-    return result
-
-
-# -------------------------
-# Display helpers
-# -------------------------
-def inject_css():
-    st.markdown(
-        """
-        <style>
-        .main {background: #f7f8fc;}
-        .block-container {padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1400px;}
-        h1, h2, h3 {color: #1d2433;}
-        .hero {
-            background: linear-gradient(135deg, #ffffff 0%, #eef3ff 100%);
-            border: 1px solid #dde5f5;
-            padding: 1.2rem 1.4rem;
-            border-radius: 18px;
-            margin-bottom: 1rem;
-            box-shadow: 0 8px 24px rgba(20, 33, 61, 0.06);
-        }
-        .subtle {color: #55627a; font-size: 0.98rem;}
-        .card {
-            background: white;
-            border: 1px solid #e5e9f2;
-            border-radius: 16px;
-            padding: 0.8rem 1rem;
-            box-shadow: 0 6px 18px rgba(20, 33, 61, 0.05);
-            margin-bottom: 1rem;
-        }
-        .metric-card {
-            background: white;
-            border: 1px solid #e5e9f2;
-            border-radius: 16px;
-            padding: 0.8rem 1rem;
-            text-align: center;
-            box-shadow: 0 6px 18px rgba(20, 33, 61, 0.05);
-        }
-        .metric-value {font-size: 1.7rem; font-weight: 700; color: #1d2433;}
-        .metric-label {font-size: 0.9rem; color: #66738a;}
-        .sheet-badge {
-            display: inline-block;
-            background: #eef3ff;
-            border: 1px solid #d8e3ff;
-            color: #3556a8;
-            border-radius: 999px;
-            font-size: 0.82rem;
-            padding: 0.25rem 0.65rem;
-            margin-right: 0.4rem;
-            margin-bottom: 0.45rem;
-        }
-        table.pretty {
-            width: 100%; border-collapse: collapse; background: white; font-size: 13px;
-            border: 1px solid #dde5f5; overflow: hidden; border-radius: 12px;
-        }
-        table.pretty th, table.pretty td {
-            border: 1px solid #e2e8f5; padding: 8px 10px; text-align: center;
-        }
-        table.pretty th {
-            background: #edf2ff; color: #1d2433; font-weight: 700;
-        }
-        table.pretty td.left, table.pretty th.left {text-align: left;}
-        .small-note {font-size: 0.86rem; color: #5e6c84;}
-        .note-item {
-            background: #ffffff; border-left: 4px solid #6b8afd; border-radius: 10px;
-            padding: 0.75rem 0.9rem; margin-bottom: 0.55rem; border-top:1px solid #e7ebf5; border-right:1px solid #e7ebf5; border-bottom:1px solid #e7ebf5;
-        }
-        .warning-item {
-            background: #fffaf0; border-left: 4px solid #f59e0b; border-radius: 10px;
-            padding: 0.75rem 0.9rem; margin-bottom: 0.55rem; border-top:1px solid #f5e7be; border-right:1px solid #f5e7be; border-bottom:1px solid #f5e7be;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    keys = {
+        "strengths": ("file", "sheet", "letter", "element", "level_range", "strength_psi"),
+        "covers": ("file", "sheet", "letter", "element", "cover"),
+        "other_strength_notes": ("file", "sheet", "note"),
+        "rebar_schedules": ("file", "sheet", "schedule", "bar_size", "concrete_psi"),
+        "qa_warnings": ("file", "sheet", "warning"),
+    }
+    for section, fields in keys.items():
+        out[section] = list({tuple(row[k] for k in fields): row for row in out[section]}.values())
+    # Do not require a fixed A-G/A-I row count. Compare other explicit strength notes
+    # only when they mention the same broad structural element and a different value.
+    terms=('FOOTING','COLUMN','SLAB','WALL','BEAM','MAT','PIER','GRADE BEAM','PILE')
+    for note in out['other_strength_notes']:
+        upper=note['note'].upper()
+        given={int(x) for x in note['strengths_psi'].split(', ') if x.isdigit()}
+        for row in out['strengths']:
+            if row['file']!=note['file']:continue
+            shared=[term for term in terms if term in upper and term in row['element'].upper()]
+            if shared and given and row['strength_psi'] not in given:
+                out['qa_warnings'].append({'file':note['file'],'sheet':note['sheet'],
+                    'page':note['page'],'warning':f"Potential different {shared[0].lower()} strength notes: {note['sheet']} lists {', '.join(f'{v:,}' for v in sorted(given))} psi; {row['sheet']} lists {row['strength_psi']:,} psi. Review applicability and overrides."})
+                break
+    return out
 
 
-def render_metric(label, value):
-    st.markdown(f"<div class='metric-card'><div class='metric-value'>{value}</div><div class='metric-label'>{label}</div></div>", unsafe_allow_html=True)
+# ---------------------------- Presentation ----------------------------
+CSS = """
+<style>
+:root {--navy:#13233e; --blue:#3266aa; --muted:#63718b; --line:#e1e8f2;}
+.block-container {max-width: 1260px; padding-top: 1.15rem; padding-bottom: 1.3rem;}
+html, body, [class*="css"] {font-family: 'Segoe UI', Arial, sans-serif;}
+h1, h2, h3 {letter-spacing:-.02em; color:#182944;}
+.app-hero {background:linear-gradient(118deg,#142845 0%,#24456c 75%,#315b88 100%); color:#fff;
+border-radius:16px; padding:22px 28px; margin-bottom:16px; box-shadow:0 12px 28px rgba(18,35,61,.12);}
+.app-kicker {color:#bdd6fc; letter-spacing:.14em; text-transform:uppercase; font-size:.71rem; font-weight:750;}
+.app-title {color:white!important; font-size:1.62rem; margin:5px 0 3px 0; font-weight:750;}
+.app-subtitle {color:#deebff; font-size:.89rem;}
+.section-heading {display:flex; justify-content:space-between; align-items:center; margin:6px 0 10px;}
+.section-heading strong {font-size:1.02rem; color:var(--navy);}
+.source-line {color:#65768f; font-size:.79rem; margin:4px 0 12px;}
+.source-tag {border:1px solid #d9e5f5; background:#f1f5fb; padding:4px 9px; border-radius:7px; margin-right:7px; display:inline-block; font-size:.77rem; color:#36577d; margin-bottom:4px;}
+.schedule-table {border-collapse:separate; border-spacing:0; width:100%; font-size:.825rem; line-height:1.25; border:1px solid #d9e2ef; border-radius:10px; overflow:hidden; background:#fff;}
+.schedule-table th {background:#eaf1fc; color:#18304f; font-weight:750;}
+.schedule-table td,.schedule-table th {padding:9px 11px; border-bottom:1px solid #e6edf6; border-right:1px solid #e6edf6; vertical-align:middle; text-align:center;}
+.schedule-table tr:last-child td {border-bottom:0;}
+.schedule-table td:last-child,.schedule-table th:last-child {border-right:0;}
+.schedule-table td.left,.schedule-table th.left {text-align:left;}
+.schedule-table tbody tr:nth-child(even) {background:#f9fbff;}
+.schedule-table td.number {font-weight:700; color:#193b64; font-variant-numeric:tabular-nums;}
+.schedule-table td.sublevel {padding-left:22px; color:#475c75;}
+.cover-foot {margin-top:9px; color:#718095; font-size:.77rem;}
+.app-footer {color:#62718b; text-align:center; font-size:.79rem; border-top:1px solid #e3e9f2; margin-top:23px; padding-top:15px;}
+[data-testid="stFileUploader"] {border-radius:12px;}
+[data-testid="stAlert"] {border-radius:9px;}
+.stButton>button[kind="primary"] {background:#2863a4; border-color:#2863a4; border-radius:8px; font-weight:700;}
+.stTabs [data-baseweb="tab-list"] {gap:18px; border-bottom:1px solid #e3e9f1;}
+.stTabs [data-baseweb="tab"] {padding:10px 3px; font-weight:600;}
+.small-status {color:#5f718c; font-size:.82rem;}
+</style>
+"""
 
 
-def render_strength_table(rows):
-    rows = sorted(rows, key=lambda r: (r['letter'], r['element'], r['level_range']))
-    html = ["<table class='pretty'>"]
-    html.append("<tr><th style='width:8%'>Ref</th><th class='left' style='width:42%'>Element</th><th class='left' style='width:28%'>Level / Range</th><th style='width:12%'>f&#8242;c (psi)</th><th style='width:10%'>Weight</th></tr>")
+def h(value):
+    return escape(str(value))
+
+
+def join_values(values, fmt="number"):
+    vals = sorted(set(values))
+    if not vals:
+        return "—"
+    if fmt == "number":
+        return " / ".join(f"{x:,}" for x in vals)
+    return " / ".join(h(x) for x in vals)
+
+
+def canonical_label(value):
+    """Same label with different punctuation/case should align between FO and S."""
+    t = re.sub(r"[^A-Z0-9]+", " ", str(value).upper()).strip()
+    return re.sub(r"\s+", " ", t)
+
+
+def comparable_rows(records, kind):
+    """Compare by element and floor, never by A/B/C reference letter."""
+    mapping = {}
+    for r in sorted(records, key=lambda a: (discipline(a["sheet"]) != "FO", a["file"], a["page"], a["letter"])):
+        key = (canonical_label(r["element"]), canonical_label(r.get("level_range", "")))
+        if key not in mapping:
+            mapping[key] = {"letter": r["letter"], "element": r["element"],
+                            "level_range": r.get("level_range", ""), "FO": set(), "S": set(),
+                            "sources": set(), "weights": set()}
+        cat = discipline(r["sheet"])
+        mapping[key].setdefault(cat, set()).add(r["strength_psi"] if kind == "strengths" else r["cover"])
+        mapping[key]['sources'].add((r['sheet'],r['page']))
+        if kind == 'strengths' and r.get('weight'):
+            mapping[key]['weights'].add(r['weight'])
+    return list(mapping.values())
+
+
+def source_labels(records):
+    output = []
+    for grp in ("FO", "S", "Other"):
+        seen = sorted({(r["sheet"], r["page"]) for r in records if discipline(r["sheet"]) == grp})
+        if seen:
+            output.append(f"<span class='source-tag'>{grp}: " + ", ".join(f"{h(sheet)} (p.{p})" for sheet, p in seen) + "</span>")
+    return "".join(output)
+
+
+def strength_table(records):
+    rows = comparable_rows(records, "strengths")
+    if not rows:
+        st.info("No readable concrete-strength schedule was detected. Check the Review tab and the original PDFs.")
+        return
+    st.markdown("<div class='section-heading'><strong>28-Day Concrete Compressive Strength</strong><span class='small-status'>As specified in the drawing · psi</span></div>", unsafe_allow_html=True)
+    st.markdown(source_labels(records), unsafe_allow_html=True)
+    unknown = any(r.get("Other") for r in rows)
+    other_head = "<th>Other drawings</th>" if unknown else ""
+    cells = ["<table class='schedule-table'><thead><tr><th style='width:5%'>Ref.</th><th class='left' style='width:36%'>Concrete element</th><th class='left' style='width:25%'>Applicable levels</th><th>Foundation (FO)</th><th>Superstructure (S)</th><th>Weight</th>" + other_head + "</tr></thead><tbody>"]
     for r in rows:
-        html.append(
-            f"<tr><td>{r['letter']}</td><td class='left'>{r['element']}</td><td class='left'>{r['level_range'] or '—'}</td><td>{r['strength_psi']:,}</td><td>{r['weight'] or '—'}</td></tr>"
-        )
-    html.append("</table>")
-    st.markdown(''.join(html), unsafe_allow_html=True)
+        cells.append(f"<tr><td>{h(r['letter'])}</td><td class='left'>{h(r['element'].title())}</td>"
+                     f"<td class='left'>{h(r['level_range'].title() or '—')}</td>"
+                     f"<td class='number'>{join_values(r['FO'])}</td><td class='number'>{join_values(r['S'])}</td><td>{join_values(r['weights'], 'text')}</td>"
+                     + (f"<td class='number'>{join_values(r.get('Other', []))}</td>" if unknown else "") + "</tr>")
+    cells.append("</tbody></table>")
+    st.markdown("".join(cells), unsafe_allow_html=True)
+    if any(len(r[grp]) > 1 for r in rows for grp in ("FO", "S")):
+        st.caption("Multiple values were found for the same element and floor range; check the listed drawing sources.")
 
 
-def render_cover_table(rows):
-    rows = sorted(rows, key=lambda r: (r['letter'], r['element']))
-    html = ["<table class='pretty'>"]
-    html.append("<tr><th style='width:10%'>Ref</th><th class='left' style='width:60%'>Element</th><th style='width:30%'>Minimum Cover</th></tr>")
+def cover_table(records):
+    rows = comparable_rows(records, "covers")
+    if not rows:
+        st.info("No readable concrete-cover schedule was detected.")
+        return
+    st.markdown("<div class='section-heading'><strong>Minimum Concrete Cover</strong><span class='small-status'>As noted in the drawings</span></div>", unsafe_allow_html=True)
+    st.markdown(source_labels(records), unsafe_allow_html=True)
+    unknown = any(r.get("Other") for r in rows)
+    other_head = "<th>Other drawings</th>" if unknown else ""
+    cells = ["<table class='schedule-table'><thead><tr><th style='width:7%'>Ref.</th><th class='left'>Concrete element / exposure</th><th style='width:25%'>Foundation (FO)</th><th style='width:25%'>Superstructure (S)</th>" + other_head + "</tr></thead><tbody>"]
     for r in rows:
-        html.append(f"<tr><td>{r['letter']}</td><td class='left'>{r['element']}</td><td>{r['cover']}</td></tr>")
-    html.append("</table>")
-    st.markdown(''.join(html), unsafe_allow_html=True)
+        cells.append(f"<tr><td>{h(r['letter'])}</td><td class='left'>{h(r['element'].title())}</td>"
+                     f"<td class='number'>{join_values(r['FO'], 'text')}</td><td class='number'>{join_values(r['S'], 'text')}</td>"
+                     + (f"<td class='number'>{join_values(r.get('Other', []), 'text')}</td>" if unknown else "") + "</tr>")
+    cells.append("</tbody></table>")
+    st.markdown("".join(cells), unsafe_allow_html=True)
 
 
-def render_schedule_table(rows, schedule_name):
-    rows = sorted(rows, key=lambda r: (int(re.sub(r'[^0-9]', '', r['bar_size'])), r['concrete_psi']))
-    bar_sizes = []
-    for r in rows:
-        if r['bar_size'] not in bar_sizes:
-            bar_sizes.append(r['bar_size'])
-
-    # index by bar, psi
-    idx = {(r['bar_size'], r['concrete_psi']): r for r in rows}
-    html = ["<table class='pretty'>"]
-    if schedule_name == 'Hooked development':
-        html.append("<tr><th rowspan='2'>Bar size</th><th colspan='2'>6,000 psi</th><th colspan='2'>8,000 psi</th><th colspan='2'>10,000 psi</th></tr>")
-        html.append("<tr><th>Ldh</th><th>Ext.</th><th>Ldh</th><th>Ext.</th><th>Ldh</th><th>Ext.</th></tr>")
-        for b in bar_sizes:
-            html.append(f"<tr><td>{b}</td>")
-            for psi in [6000, 8000, 10000]:
-                r = idx.get((b, psi), {})
-                html.append(f"<td>{r.get('tension_typ_in', '—') if r.get('tension_typ_in') is not None else '—'}</td>")
-                html.append(f"<td>{r.get('hook_extension_in', '—') if r.get('hook_extension_in') is not None else '—'}</td>")
-            html.append("</tr>")
+def rebar_schedule_table(records, schedule):
+    if not records:
+        st.info(f"No {schedule.lower()} schedule was found for this drawing set.")
+        return
+    strengths=sorted({r["concrete_psi"] for r in records})
+    grouped = defaultdict(dict)
+    for r in records:
+        grouped[r["bar_size"]][r["concrete_psi"]] = r
+    bar_list = sorted(grouped, key=lambda s: int(s.lstrip("#")))
+    hook = schedule == "Hooked development"
+    headers = ("<tr><th rowspan='2'>Bar</th>" + "".join(f"<th colspan='{2 if hook else 3}'>{v:,} psi</th>" for v in strengths) + "</tr>")
+    headers += "<tr>" + (("<th>Ldh</th><th>Ext.</th>" * len(strengths)) if hook else ("<th>Typ.</th><th>Top</th><th>Comp.</th>" * len(strengths))) + "</tr>"
+    body = []
+    fields = ("tension_typ_in", "hook_extension_in") if hook else ("tension_typ_in", "tension_top_in", "compression_in")
+    for bar in bar_list:
+        row = [f"<tr><td class='number'>{h(bar)}</td>"]
+        for psi in strengths:
+            item = grouped[bar].get(psi)
+            for field in fields:
+                val = item.get(field) if item else None
+                row.append(f"<td>{h(val) if val is not None else '—'}</td>")
+        row.append("</tr>")
+        body.append("".join(row))
+    st.markdown("<div class='section-heading'><strong>" + h(schedule) + " lengths</strong><span class='small-status'>All dimensions in inches</span></div>", unsafe_allow_html=True)
+    st.markdown("<table class='schedule-table'><thead>" + headers + "</thead><tbody>" + "".join(body) + "</tbody></table>", unsafe_allow_html=True)
+    if schedule == "Lap splice":
+        st.markdown("<div class='cover-foot'>Typ. / Top = tension splice lengths; Comp. = compression splice length. For larger bars, follow the project-specific splice requirements.</div>", unsafe_allow_html=True)
+    elif schedule == "Straight development":
+        st.markdown("<div class='cover-foot'>Typ. / Top = tension development lengths; Comp. = compression development length.</div>", unsafe_allow_html=True)
     else:
-        html.append("<tr><th rowspan='2'>Bar size</th><th colspan='3'>6,000 psi</th><th colspan='3'>8,000 psi</th><th colspan='3'>10,000 psi</th></tr>")
-        html.append("<tr><th>Typ.</th><th>Top</th><th>Comp.</th><th>Typ.</th><th>Top</th><th>Comp.</th><th>Typ.</th><th>Top</th><th>Comp.</th></tr>")
-        for b in bar_sizes:
-            html.append(f"<tr><td>{b}</td>")
-            for psi in [6000, 8000, 10000]:
-                r = idx.get((b, psi), {})
-                html.append(f"<td>{r.get('tension_typ_in', '—') if r.get('tension_typ_in') is not None else '—'}</td>")
-                html.append(f"<td>{r.get('tension_top_in', '—') if r.get('tension_top_in') is not None else '—'}</td>")
-                html.append(f"<td>{r.get('compression_in', '—') if r.get('compression_in') is not None else '—'}</td>")
-            html.append("</tr>")
-    html.append("</table>")
-    st.markdown(''.join(html), unsafe_allow_html=True)
+        st.markdown("<div class='cover-foot'>Ldh = hooked tension development length; Ext. = extension. Verify hook type and associated drawing notes.</div>", unsafe_allow_html=True)
 
 
-def group_by_sheet(rows):
-    grouped = defaultdict(list)
-    for row in rows:
-        key = (row['file'], row['sheet'], row['page'])
-        grouped[key].append(row)
-    return grouped
-
-
-def excel_bytes(result):
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine='openpyxl') as writer:
-        pd.DataFrame(result['strengths']).to_excel(writer, sheet_name='Strengths', index=False)
-        pd.DataFrame(result['covers']).to_excel(writer, sheet_name='Covers', index=False)
-        pd.DataFrame(result['rebar_schedules']).to_excel(writer, sheet_name='RebarSchedules', index=False)
-        pd.DataFrame(result['notes']).to_excel(writer, sheet_name='Notes', index=False)
-        pd.DataFrame(result['qa_warnings']).to_excel(writer, sheet_name='QAWarnings', index=False)
-        for ws in writer.book.worksheets:
-            ws.freeze_panes = 'A2'
+def excel_report(result):
+    output = io.BytesIO()
+    strengths = comparable_rows(result["strengths"], "strengths")
+    covers = comparable_rows(result["covers"], "covers")
+    def comparison_df(rows, kind):
+        return pd.DataFrame([{"ref": r["letter"], "element": r["element"],
+                              **({"levels": r["level_range"]} if kind == "strengths" else {}),
+                              "foundation_FO": join_values(r["FO"], "number" if kind == "strengths" else "text"),
+                              "superstructure_S": join_values(r["S"], "number" if kind == "strengths" else "text")}
+                             for r in rows])
+    sheets = {
+        "Strength comparison": comparison_df(strengths, "strengths"),
+        "Cover comparison": comparison_df(covers, "covers"),
+        "Strength source data": pd.DataFrame(result["strengths"]),
+        "Cover source data": pd.DataFrame(result["covers"]),
+        "Rebar schedule data": pd.DataFrame(result["rebar_schedules"]),
+        "Additional strength notes": pd.DataFrame(result["other_strength_notes"]),
+        "QA warnings": pd.DataFrame(result["qa_warnings"]),
+    }
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            if df.empty:
+                df = pd.DataFrame({"message": ["No records detected"]})
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+            ws = writer.sheets[name[:31]]
+            ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
             for col in ws.columns:
-                letter = col[0].column_letter
-                max_len = max(len(str(c.value or '')) for c in col[:100])
-                ws.column_dimensions[letter].width = min(40, max(12, max_len + 2))
-    return out.getvalue()
+                ws.column_dimensions[col[0].column_letter].width = min(42, max(12, max(len(str(cell.value or "")) for cell in list(col)[:100]) + 2))
+    return output.getvalue()
 
 
-def zip_bytes(result):
-    data = io.BytesIO()
-    with zipfile.ZipFile(data, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr('structural_extraction_v4.json', json.dumps(result, indent=2))
-        zf.writestr('strengths.csv', pd.DataFrame(result['strengths']).to_csv(index=False))
-        zf.writestr('covers.csv', pd.DataFrame(result['covers']).to_csv(index=False))
-        zf.writestr('rebar_schedules.csv', pd.DataFrame(result['rebar_schedules']).to_csv(index=False))
-        zf.writestr('notes.csv', pd.DataFrame(result['notes']).to_csv(index=False))
-        zf.writestr('qa_warnings.csv', pd.DataFrame(result['qa_warnings']).to_csv(index=False))
-    return data.getvalue()
-
-
-# -------------------------
-# App UI
-# -------------------------
 def run_app():
-    inject_css()
-    st.set_page_config(page_title='Structural Drawing PDF Extractor — V4', layout='wide')
-    st.markdown("<div class='hero'><h1>Structural Drawing PDF Extractor — V4</h1><div class='subtle'>Compact drawing-style schedules for concrete strengths, covers, lap splice lengths, development lengths, and key notes — with a cleaner layout designed for quick review.</div></div>", unsafe_allow_html=True)
+    st.set_page_config(page_title="Structural Drawing Analyzer | Elevated Engineering NYC", layout="wide", page_icon="🏗️")
+    st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown("""<div class='app-hero'>
+<div class='app-kicker'>Elevated Engineering NYC · Structural Design</div>
+<div class='app-title'>Structural Drawing Analyzer</div>
+<div class='app-subtitle'>Adaptable concrete-strength schedules · Covers · Reinforcement lengths</div>
+</div>""", unsafe_allow_html=True)
 
-    files = st.file_uploader('Upload foundation and structural drawing PDFs', type=['pdf'], accept_multiple_files=True)
+    files = st.file_uploader("Upload foundation and superstructure drawing PDFs", type="pdf", accept_multiple_files=True)
+    go = st.button("Extract drawing schedules", type="primary")
+    signature = [(f.name, f.size) for f in files] if files else []
+    if go:
+        if not files:
+            st.info("Upload one or more drawing PDFs first.")
+        else:
+            with st.spinner("Extracting drawing schedules…"):
+                try:
+                    st.session_state["v6_result"] = extract_files(files)
+                    st.session_state["v6_signature"] = signature
+                except Exception as exc:
+                    st.error(f"Unable to analyze the uploaded PDF: {exc}")
 
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        run = st.button('Extract drawing information', type='primary', use_container_width=True)
-    with col2:
-        st.markdown("<div class='small-note'>Tip: upload both foundation and superstructure sets. Results are grouped by drawing sheet so you can review them with minimal scrolling.</div>", unsafe_allow_html=True)
-
-    if files and run:
-        with st.spinner('Reading drawings and building compact schedules…'):
-            st.session_state['extract_result_v4'] = extract_files(files)
-
-    if 'extract_result_v4' in st.session_state:
-        result = st.session_state['extract_result_v4']
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1:
-            render_metric('Files', len({r['file'] for k in ['strengths', 'covers', 'rebar_schedules', 'notes'] for r in result[k]}))
-        with c2:
-            render_metric('Strength rows', len(result['strengths']))
-        with c3:
-            render_metric('Cover rows', len(result['covers']))
-        with c4:
-            render_metric('Schedule entries', len(result['rebar_schedules']))
-        with c5:
-            render_metric('QA warnings', len(result['qa_warnings']))
-
-        tabs = st.tabs(['Overview', 'Strengths', 'Covers', 'Rebar schedules', 'Notes & warnings', 'Downloads'])
-
-        with tabs[0]:
-            st.markdown("<div class='card'><h3>Detected drawing sheets</h3>", unsafe_allow_html=True)
-            seen = []
-            for group_name in ['strengths', 'covers', 'rebar_schedules']:
-                for r in result[group_name]:
-                    badge = (r['file'], r['sheet'], r['page'])
-                    if badge not in seen:
-                        seen.append(badge)
-            if seen:
-                badges = ''.join([f"<span class='sheet-badge'>{Path(f).name} · {s} · p.{p}</span>" for f, s, p in seen])
-                st.markdown(badges, unsafe_allow_html=True)
+    if "v6_result" in st.session_state and st.session_state.get("v6_signature") != signature:
+        st.info("Files changed. Click Extract drawing schedules to refresh the results.")
+    elif "v6_result" in st.session_state:
+        data = st.session_state["v6_result"]
+        strength_count = len(comparable_rows(data["strengths"], "strengths"))
+        cover_count = len(comparable_rows(data["covers"], "covers"))
+        st.markdown(f"<div class='source-line'>{data['file_count']} PDF(s) · {data['page_count']} pages · {strength_count} strength rows · {cover_count} cover rows</div>", unsafe_allow_html=True)
+        tab_strength, tab_cover, tab_rebar, tab_export = st.tabs([
+            "Concrete strengths", "Concrete covers", "Lap & development", "Review & export"
+        ])
+        with tab_strength:
+            strength_table(data["strengths"])
+        with tab_cover:
+            cover_table(data["covers"])
+        with tab_rebar:
+            schedules = data["rebar_schedules"]
+            sources = []
+            for typ in ("S", "FO"):
+                if any(discipline(r["sheet"]) == typ for r in schedules):
+                    sources.append(typ)
+            if sources:
+                labels = {"S": "Superstructure (S)", "FO": "Foundation (FO)"}
+                source = st.radio("Drawing set", sources, format_func=lambda x: labels[x], horizontal=True)
+                specific = [r for r in schedules if discipline(r["sheet"]) == source]
+                st.markdown(source_labels(specific), unsafe_allow_html=True)
+                t1, t2, t3 = st.tabs(["Lap splice", "Straight development", "Hooked development"])
+                for tab, kind in zip((t1, t2, t3), ("Lap splice", "Straight development", "Hooked development")):
+                    with tab:
+                        rebar_schedule_table([r for r in specific if r["schedule"] == kind], kind)
             else:
-                st.info('No schedule-style data detected yet.')
-            st.markdown("</div>", unsafe_allow_html=True)
-            st.markdown("<div class='card'><h3>What changed in V4</h3><ul><li>Much shorter output with schedule-style tables.</li><li>Strengths and covers shown like drawing notes, not long raw lists.</li><li>Lap/development lengths grouped into compact tables.</li><li>Cleaner layout for easier review on one screen.</li></ul></div>", unsafe_allow_html=True)
-
-        with tabs[1]:
-            groups = group_by_sheet(result['strengths'])
-            if not groups:
-                st.info('No concrete strength schedules detected.')
-            for (file_name, sheet, page_num), rows in groups.items():
-                st.markdown(f"<div class='card'><h3>Concrete Strength Schedule</h3><div class='small-note'>{Path(file_name).name} · {sheet} · page {page_num}</div>", unsafe_allow_html=True)
-                render_strength_table(rows)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-        with tabs[2]:
-            groups = group_by_sheet(result['covers'])
-            if not groups:
-                st.info('No concrete cover schedules detected.')
-            for (file_name, sheet, page_num), rows in groups.items():
-                st.markdown(f"<div class='card'><h3>Concrete Cover Schedule</h3><div class='small-note'>{Path(file_name).name} · {sheet} · page {page_num}</div>", unsafe_allow_html=True)
-                render_cover_table(rows)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-        with tabs[3]:
-            schedule_groups = defaultdict(list)
-            for r in result['rebar_schedules']:
-                schedule_groups[(r['file'], r['sheet'], r['page'], r['schedule'])].append(r)
-            if not schedule_groups:
-                st.info('No rebar schedule tables detected.')
-            order = ['Lap splice', 'Straight development', 'Hooked development']
-            for key in sorted(schedule_groups.keys(), key=lambda x: (x[0], x[1], order.index(x[3]) if x[3] in order else 99)):
-                file_name, sheet, page_num, schedule_name = key
-                rows = schedule_groups[key]
-                st.markdown(f"<div class='card'><h3>{schedule_name} Schedule</h3><div class='small-note'>{Path(file_name).name} · {sheet} · page {page_num}</div>", unsafe_allow_html=True)
-                render_schedule_table(rows, schedule_name)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-        with tabs[4]:
-            st.markdown("<div class='card'><h3>Key notes</h3>", unsafe_allow_html=True)
-            if result['notes']:
-                for n in sorted(result['notes'], key=lambda r: (r['file'], r['sheet'], r['category'])):
-                    st.markdown(f"<div class='note-item'><strong>{n['category']}</strong><br><span class='small-note'>{Path(n['file']).name} · {n['sheet']} · page {n['page']}</span><br>{n['note']}</div>", unsafe_allow_html=True)
-            else:
-                st.info('No notes detected.')
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            st.markdown("<div class='card'><h3>QA warnings</h3>", unsafe_allow_html=True)
-            if result['qa_warnings']:
-                for w in sorted(result['qa_warnings'], key=lambda r: (r['file'], r['sheet'])):
-                    st.markdown(f"<div class='warning-item'><strong>{Path(w['file']).name} · {w['sheet']} · page {w['page']}</strong><br>{w['warning']}</div>", unsafe_allow_html=True)
-            else:
-                st.success('No QA warnings were generated.')
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        with tabs[5]:
-            st.markdown("<div class='card'><h3>Download results</h3><div class='small-note'>Exports still include the structured schedule data for Excel/JSON review.</div></div>", unsafe_allow_html=True)
-            st.download_button('Download Excel report', data=excel_bytes(result), file_name='structural_extraction_v4.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-            st.download_button('Download ZIP bundle (JSON + CSV)', data=zip_bytes(result), file_name='structural_extraction_v4_bundle.zip', mime='application/zip')
-
-        st.warning('Engineering review is still required. Missing cells, scanned pages, and drawing-specific exceptions must be checked against the original sheets.')
+                st.info("No reinforcement schedules could be extracted.")
+        with tab_export:
+            st.markdown("**Download extracted schedules**")
+            left, right = st.columns(2)
+            with left:
+                st.download_button("Download Excel workbook", excel_report(data),
+                                   file_name="structural_analyzer_v6.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            with right:
+                st.download_button("Download JSON", json.dumps(data, indent=2),
+                                   file_name="structural_analyzer_v6.json", mime="application/json")
+            if data["other_strength_notes"]:
+                with st.expander(f"Other compressive-strength notes ({len(data['other_strength_notes'])})"):
+                    for r in data["other_strength_notes"]:
+                        st.markdown(f"**{h(r['sheet'])} · p.{r['page']}** — {h(r['note'])}")
+            with st.expander(f"Extraction QA ({len(data['qa_warnings'])} warnings)"):
+                if data["qa_warnings"]:
+                    for r in data["qa_warnings"]:
+                        st.caption(f"{r['sheet']} / page {r['page']}: {r['warning']}")
+                else:
+                    st.caption("No missing table cells detected. Always verify against the drawing originals.")
+            st.caption("This tool reads embedded PDF text. It cannot guarantee accuracy for all drawing formats. Scanned sheets, unusual layouts, and conflicting notes require verification.")
+    st.markdown("<div class='app-footer'>Developed by <strong>Elevated Engineering NYC</strong> · Structural Drawing Analyzer</div>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
