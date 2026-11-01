@@ -1,9 +1,24 @@
-# Structural PDF Extractor V3
+# Structural PDF Extractor V4
 
-Install: `pip install -r requirements.txt`
+Cleaner Streamlit interface for structural and foundation drawing PDFs.
 
-Run: `streamlit run app.py`
+## Improvements in V4
+- Compact **Concrete Strength Schedule** table.
+- Compact **Concrete Cover Schedule** table.
+- Drawing-style **Lap Splice**, **Straight Development**, and **Hooked Development** schedules.
+- Better looking website UI with tabs, cards, and grouped sheets.
+- Download results as Excel or ZIP (JSON + CSV).
 
-Upload one or more structural/foundation drawing PDFs. Download Excel or JSON.
+## Install / run locally
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-This version handles PDF embedded text and fixed-layout schedules resembling the supplied 202 East 120th Street drawings. It flags missing table cells. It does **not** guarantee 100% coverage of arbitrary layouts, scans or superseding drawing notes; check against originals.
+## Update on GitHub / Streamlit
+Replace these files in your repo:
+- `app.py`
+- `README.md`
+- `requirements.txt`
+
+Then Streamlit should redeploy automatically.
